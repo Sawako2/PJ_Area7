@@ -14,15 +14,16 @@ Auto Minigame v6  (ไร้แถบหัวหน้าต่าง + ปุ�
 #  >>> ระบบกรอกคีย์ (เพิ่มใหม่) <<<
 #  ระบบคีย์แสดงใน UI หลักและเริ่ม worker หลังยืนยันสิทธิ์แล้ว
 # =====================================================================
-KEYS_URL = "https://raw.githubusercontent.com/Sawako2/Key-Area7/refs/heads/main/keys.txt"      # <<< ใส่ลิงก์ Raw ของ keys.txt
+SUPABASE_URL = "https://cgsuxxyezqhxayllhzfs.supabase.co"
+SUPABASE_KEY = "sb_publishable_YvFpfdUYUF1b7L2VbFyZ5Q_RKLN-Mr3"   # Publishable key: ใส่ในสคริปต์ได้ (ผู้ใช้เรียกได้แค่ redeem_key / check_key ใน supabase_license.sql)
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1571826463991275621/wYLet8g7vUhhnzC25kknfh1_sNKPf2cuqb8eV0x3BW2qAarhdVXUR6n5njgJX6RK79CO"     # ตั้งค่า webhook ใหม่เองหากต้องการเปิดแจ้งเตือน
 LICENSE_APP_SECRET = "กรอกคีย์เพื่อเริ่มใช้งาน"                  # ใช้เข้ารหัสไฟล์จำคีย์ในเครื่อง
 LICENSE_TITLE = "Auto Minigame"        # ชื่อที่โชว์บนหน้าต่างกรอกคีย์
 BADGE_CORNER = "topright"              # มุมป้ายเวลาคงเหลือ: topright / topleft / bottomright / bottomleft
-REVOKE_IF_REMOVED = True               # True = ถ้าลบคีย์ออกจาก keys.txt บน GitHub คีย์นั้นจะใช้ไม่ได้ทันที (ตอนมีเน็ต)
+REVOKE_IF_REMOVED = True               # True = ถ้าคีย์ถูกยกเลิก/ลบออกจาก Supabase คีย์นั้นจะใช้ไม่ได้ทันที (ตอนมีเน็ต)
 ALLOW_OFFLINE = True                   # True = เปิดซ้ำตอนเน็ตหลุดได้ (ยังเช็คเวลาย้อนหลังจากไฟล์ในเครื่อง)
 CLOCK_TOLERANCE = 300                  # ยอมให้เวลาเครื่องคลาดเคลื่อนจากเวลาจริงได้กี่วินาที (5 นาที)
-RECHECK_INTERVAL = 60                  # ระหว่างใช้งาน เช็ค keys.txt ซ้ำทุกกี่วินาที (คีย์ถูกลบ = ปิดโปรแกรมทันที)
+RECHECK_INTERVAL = 60                  # ระหว่างใช้งาน เช็คคีย์กับ Supabase ซ้ำทุกกี่วินาที (คีย์ถูกยกเลิก/ถูกรีเซ็ต/ไปผูกเครื่องอื่น = ปิดโปรแกรม)
 OFFLINE_GRACE = 600                    # ถ้ายืนยันกับเซิร์ฟเวอร์ไม่ได้ติดต่อกันเกินกี่วินาที -> ไม่ให้ใช้ต่อ (กันตัดเน็ตเพื่อเลี่ยงการยกเลิกคีย์)
 
 import os
@@ -213,36 +214,63 @@ def _fallback_time():
     return None
 
 
-def fetch_keys():
-    """คืน (เซ็ตคีย์ที่ถูกต้อง, เวลาจริงจากเน็ต หรือ None) / เน็ตมีปัญหา -> LicenseError(code='net')"""
-    if "USERNAME" in KEYS_URL or not KEYS_URL.startswith("http"):
-        raise LicenseError("ยังไม่ได้ตั้งค่า KEYS_URL ในสคริปต์ (ใส่ลิงก์ Raw ของไฟล์ keys.txt)", "config")
+def _sb_rpc(fn, payload):
+    """เรียกฟังก์ชันบน Supabase -> (ผลลัพธ์ dict, เวลาจริงของเซิร์ฟเวอร์ หรือ None)
+    เน็ตมีปัญหา -> LicenseError(code='net') / ตั้งค่าผิด -> LicenseError(code='config')"""
+    if not str(SUPABASE_URL).startswith("http") or not SUPABASE_KEY:
+        raise LicenseError("ยังไม่ได้ตั้งค่า SUPABASE_URL / SUPABASE_KEY ในสคริปต์", "config")
+    headers = {"apikey": SUPABASE_KEY, "Content-Type": "application/json"}
+    if SUPABASE_KEY.startswith("eyJ"):                  # คีย์แบบ JWT เดิมต้องส่ง Authorization ด้วย (sb_... ไม่ต้อง)
+        headers["Authorization"] = "Bearer " + SUPABASE_KEY
     try:
-        with _http(KEYS_URL, timeout=8) as r:
-            body = r.read(2_000_000).decode("utf-8", "replace")
+        with _http(SUPABASE_URL.rstrip("/") + "/rest/v1/rpc/" + fn, timeout=8, method="POST",
+                   data=json.dumps(payload).encode("utf-8"), headers=headers) as r:
+            res = json.loads(r.read(200_000).decode("utf-8", "replace"))
             try:
-                net = _resp_time(r.headers)
+                hdr_time = _resp_time(r.headers)
             except Exception:
-                net = None
+                hdr_time = None
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            raise LicenseError("ไม่พบไฟล์รายการคีย์ (HTTP 404) กรุณาตรวจสอบลิงก์ KEYS_URL", "config")
+            raise LicenseError("ไม่พบฟังก์ชันตรวจคีย์บน Supabase (ยังไม่ได้รัน supabase_license.sql)", "config")
+        if e.code in (400, 401, 403):
+            raise LicenseError(f"Supabase ปฏิเสธคำขอ (HTTP {e.code}) กรุณาตรวจสอบ SUPABASE_KEY และการติดตั้งฟังก์ชัน", "config")
         raise LicenseError(f"เซิร์ฟเวอร์ตอบกลับผิดปกติ (HTTP {e.code}) กรุณาลองใหม่ภายหลัง", "net")
     except (urllib.error.URLError, OSError) as e:
         reason = getattr(e, "reason", e)
         if isinstance(reason, (socket.timeout, TimeoutError)):
             raise LicenseError("เซิร์ฟเวอร์ตอบช้าเกินไป (หมดเวลาเชื่อมต่อ) กรุณาลองใหม่อีกครั้ง", "net")
         raise LicenseError("เชื่อมต่ออินเทอร์เน็ตไม่ได้ กรุณาตรวจสอบเน็ตแล้วลองใหม่", "net")
-    keys = set()
-    for line in body.splitlines():
-        line = line.strip().lstrip("\ufeff")
-        if line and not line.startswith("#"):
-            p = parse_key(line)
-            if p:
-                keys.add(p[0])
-    if net is None:
-        net = _fallback_time()
-    return keys, net
+    except ValueError:
+        raise LicenseError("เซิร์ฟเวอร์ตอบกลับข้อมูลไม่ถูกต้อง กรุณาลองใหม่ภายหลัง", "net")
+    if not isinstance(res, dict):
+        raise LicenseError("เซิร์ฟเวอร์ตอบกลับข้อมูลไม่ถูกต้อง กรุณาลองใหม่ภายหลัง", "net")
+    st_ = res.get("server_time")                        # เวลาจริงจากเซิร์ฟเวอร์ (แม่นกว่า HTTP Date)
+    net = float(st_) if isinstance(st_, (int, float)) else (hdr_time if hdr_time is not None else _fallback_time())
+    return res, net
+
+
+def sb_redeem(norm):
+    """กรอกคีย์: เปิดใช้ครั้งแรก / เปิดซ้ำเครื่องเดิม / ผูกเครื่องใหม่หลังแอดมินรีเซ็ต HWID (เซิร์ฟเวอร์เป็นคนบันทึกเวลาเริ่ม)"""
+    return _sb_rpc("redeem_key", {"p_key": norm, "p_hwid": _hwid(), "p_machine": (platform.node() or "")[:80],
+                                  "p_client_time": time.time(), "p_tolerance": CLOCK_TOLERANCE})
+
+
+def sb_check(norm):
+    """ตรวจคีย์ที่ใช้อยู่ (อ่านอย่างเดียว ไม่แก้ข้อมูล)"""
+    return _sb_rpc("check_key", {"p_key": norm, "p_hwid": _hwid()})
+
+
+# ข้อความตามโค้ดผลลัพธ์จากเซิร์ฟเวอร์
+_SB_MSG = {
+    "invalid": "ไม่พบคีย์นี้ในระบบ กรุณาตรวจสอบตัวอักษรอีกครั้ง",
+    "revoked": "คีย์นี้ถูกยกเลิกแล้ว กรุณาใช้คีย์ใหม่",
+    "hwid": "คีย์นี้ถูกใช้ไปแล้วหรือผูกกับอุปกรณ์อื่น",
+    "unbound": "คีย์นี้ถูกรีเซ็ตเครื่องแล้ว กรุณากรอกคีย์อีกครั้งเพื่อผูกกับเครื่องนี้",
+    "unused": "ไม่พบการเปิดใช้คีย์นี้ในระบบ กรุณากรอกคีย์อีกครั้ง",
+    "expired": "คีย์นี้หมดอายุแล้ว",
+    "clock": "เวลาในเครื่องไม่ตรงกับเวลาจริง (คลาดเกิน 5 นาที) กรุณาตั้งเวลาเครื่องให้ถูกต้องแล้วเปิดใหม่",
+}
 
 
 # ---------------------------------------------------------------------
@@ -368,26 +396,22 @@ def activate(key_text):
     if not p:
         raise LicenseError("รูปแบบคีย์ไม่ถูกต้อง ตัวอย่าง: AREA7KEY-K3F9Q2_24hr", "format")
     norm, secs = p
-    keys, net = fetch_keys()
+    res, net = sb_redeem(norm)
+    if not res.get("ok"):
+        code = res.get("code")
+        raise _fail(_SB_MSG.get(code, "ตรวจสอบคีย์ไม่สำเร็จ กรุณาลองใหม่"), code if code in _SB_MSG else "error", norm)
     st = _state_load()
     now = _verify_time(st, net, norm)
-    if norm not in keys:
-        raise _fail("ไม่พบคีย์นี้ในระบบ กรุณาตรวจสอบตัวอักษรอีกครั้ง", "invalid", norm)
-    ent = st["keys"].get(norm)
-    is_new = ent is None
-    if is_new:
-        ent = {"start": now, "hwid": _hwid()}
-    elif ent.get("hwid") != _hwid():
-        raise _fail("คีย์นี้ถูกใช้ไปแล้วหรือผูกกับอุปกรณ์อื่น", "hwid", norm)
-    expiry = ent["start"] + secs
+    start = float(res["used_at"])                      # เวลาเริ่มใช้ตามเซิร์ฟเวอร์
+    expiry = start + secs
     if now >= expiry:
         raise _fail("คีย์นี้หมดอายุแล้ว", "expired", norm)
-    st["keys"][norm] = ent
+    st["keys"][norm] = {"start": start, "hwid": _hwid()}
     st["cur"] = norm
     st["last_seen"] = max(float(st.get("last_seen") or 0), now)
     st["last_verified"] = now
     _state_save(st)
-    if is_new:      # ส่ง log ทุกครั้งที่เปิดใช้ครั้งแรก เพื่อให้คุณตรวจว่าซ้ำหรือไม่
+    if res.get("first"):    # ส่ง log ทุกครั้งที่เปิดใช้ครั้งแรก เพื่อให้คุณตรวจว่าซ้ำหรือไม่
         discord_notify("activated", norm, force=True, extra={
             "ระยะเวลา": _dur_text(secs),
             "หมดอายุ": f"<t:{int(expiry)}:F>"})
@@ -404,21 +428,37 @@ def check_saved():
         return None
     if ent.get("hwid") != _hwid():
         raise _fail("คีย์นี้ถูกใช้ไปแล้วหรือผูกกับอุปกรณ์อื่น", "hwid", norm)
-    offline = False
+    offline, res = False, None
     try:
-        keys, net = fetch_keys()
+        res, net = sb_check(norm)
     except LicenseError as e:
         if e.code != "net" or not ALLOW_OFFLINE:
             raise
         if time.time() - float(st.get("last_verified") or 0) > OFFLINE_GRACE:
             raise LicenseError("ต้องเชื่อมต่ออินเทอร์เน็ตเพื่อยืนยันสถานะคีย์ก่อนใช้งาน (ออฟไลน์ได้ไม่เกิน "
                                f"{max(1, OFFLINE_GRACE // 60)} นาทีหลังตรวจสอบล่าสุด)", "net")
-        keys, net, offline = None, None, True
+        net, offline = None, True
     now = _verify_time(st, net, norm)
-    if keys is not None and REVOKE_IF_REMOVED and norm not in keys:
-        st["cur"] = None
-        _state_save(st)
-        raise _fail("คีย์นี้ถูกยกเลิกแล้ว กรุณาใช้คีย์ใหม่", "revoked", norm)
+    if res is not None:
+        code = res.get("code")
+        if code in ("revoked", "invalid"):
+            if REVOKE_IF_REMOVED:
+                st["cur"] = None
+                _state_save(st)
+                raise _fail(_SB_MSG["revoked"], "revoked", norm)
+        elif code in ("hwid", "unbound", "unused"):
+            st["cur"] = None
+            _state_save(st)
+            raise _fail(_SB_MSG[code], code, norm)
+        elif code == "expired":
+            st["cur"] = None
+            _state_save(st)
+            raise _fail("คีย์ที่บันทึกไว้หมดอายุแล้ว กรุณาใส่คีย์ใหม่", "expired", norm)
+        elif res.get("ok") and res.get("used_at"):
+            ent["start"] = float(res["used_at"])        # เวลาเริ่มใช้ตามเซิร์ฟเวอร์เป็นหลัก
+            st["keys"][norm] = ent
+        else:
+            raise LicenseError(_SB_MSG.get(code, "ตรวจสอบคีย์ไม่สำเร็จ กรุณาลองใหม่"), "error")
     expiry = ent["start"] + p[1]
     if now >= expiry:
         st["cur"] = None
@@ -1101,15 +1141,21 @@ def _on_expired():
 
 
 def _recheck_online():
-    """ตรวจกับ keys.txt บน GitHub ขณะใช้งาน (เรียกในเธรดเฝ้า) — คีย์ถูกลบ = ปิดโปรแกรมทันที"""
-    try:
-        keys, net = fetch_keys()
-    except LicenseError:
-        return False                            # เช็คไม่ได้ (เน็ตหลุด/ลิงก์มีปัญหา) — ปล่อยให้ตัวนับช่วงออฟไลน์ตัดสิน
+    """ตรวจคีย์กับ Supabase ขณะใช้งาน (เรียกในเธรดเฝ้า) — ถูกยกเลิก/ถูกรีเซ็ต/ไปผูกเครื่องอื่น = ปิดโปรแกรม"""
     key = _LIC.get("key")
-    if key and key not in keys:
+    if not key:
+        return True
+    try:
+        res, net = sb_check(key)
+    except LicenseError:
+        return False                            # เช็คไม่ได้ (เน็ตหลุด/เซิร์ฟเวอร์มีปัญหา) — ปล่อยให้ตัวนับช่วงออฟไลน์ตัดสิน
+    code = res.get("code")
+    if code in ("revoked", "invalid") and REVOKE_IF_REMOVED:
         _stop_with("คีย์นี้ถูกยกเลิกแล้ว ไม่สามารถใช้งานต่อได้", "revoked",
-                   {"สถานะ": "ถูกลบออกจากรายการคีย์ขณะกำลังใช้งาน"}, clear_cur=True)
+                   {"สถานะ": "ถูกยกเลิกขณะกำลังใช้งาน"}, clear_cur=True)
+    elif code in ("hwid", "unbound", "unused"):
+        _stop_with("คีย์นี้ถูกรีเซ็ตเครื่องหรือถูกใช้บนอุปกรณ์อื่นแล้ว ไม่สามารถใช้งานต่อได้\nกรุณาเปิดโปรแกรมใหม่แล้วกรอกคีย์อีกครั้ง",
+                   "hwid" if code == "hwid" else None, {"สถานะ": "ผูกกับเครื่องอื่นขณะกำลังใช้งาน"}, clear_cur=True)
     return True
 
 
