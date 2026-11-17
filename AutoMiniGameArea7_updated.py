@@ -16,7 +16,10 @@ Auto Minigame v6  (ไร้แถบหัวหน้าต่าง + ปุ�
 # =====================================================================
 SUPABASE_URL = "https://cgsuxxyezqhxayllhzfs.supabase.co"
 SUPABASE_KEY = "sb_publishable_YvFpfdUYUF1b7L2VbFyZ5Q_RKLN-Mr3"   # Publishable key: ใส่ในสคริปต์ได้ (ผู้ใช้เรียกได้แค่ redeem_key / check_key ใน supabase_license.sql)
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1571826463991275621/wYLet8g7vUhhnzC25kknfh1_sNKPf2cuqb8eV0x3BW2qAarhdVXUR6n5njgJX6RK79CO"     # ตั้งค่า webhook ใหม่เองหากต้องการเปิดแจ้งเตือน
+DISCORD_WEBHOOK_URL = ""  # ตั้งค่าใหม่หลังสร้าง webhook ใหม่ หากต้องการแจ้งเตือน
+DISCORD_SERVER_ID = "1572061109714948166"
+DISCORD_WIDGET_API = f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/widget.json"
+DISCORD_INVITE_URL = "https://discord.gg/mr8MmUURw9"
 LICENSE_APP_SECRET = "กรอกคีย์เพื่อเริ่มใช้งาน"                  # ใช้เข้ารหัสไฟล์จำคีย์ในเครื่อง
 LICENSE_TITLE = "Auto Minigame"        # ชื่อที่โชว์บนหน้าต่างกรอกคีย์
 BADGE_CORNER = "topright"              # มุมป้ายเวลาคงเหลือ: topright / topleft / bottomright / bottomleft
@@ -3160,6 +3163,8 @@ class Handler(BaseHTTPRequestHandler):
     core = None
     token = ""
     port = 0
+    discord_cache = {"at": 0.0, "payload": None}
+    discord_lock = threading.Lock()
 
     def log_message(self, *a):
         pass
@@ -3193,6 +3198,60 @@ class Handler(BaseHTTPRequestHandler):
             payload = self.core.snapshot(since)
             payload["license"] = _license_ui_snapshot()
             return self._send(200, json.dumps(payload))
+        if u.path == "/api/discord_widget":
+            now = time.monotonic()
+            with self.discord_lock:
+                cached = self.discord_cache.get("payload")
+                if cached is None or now - self.discord_cache.get("at", 0.0) >= 30:
+                    try:
+                        req = urllib.request.Request(
+                            DISCORD_WIDGET_API,
+                            headers={"User-Agent": _UA, "Accept": "application/json"},
+                        )
+                        with urllib.request.urlopen(req, timeout=6) as response:
+                            raw = json.loads(response.read(1024 * 1024).decode("utf-8"))
+                        if not isinstance(raw, dict):
+                            raise ValueError("invalid widget response")
+                        members = []
+                        for member in raw.get("members", [])[:100]:
+                            if not isinstance(member, dict):
+                                continue
+                            status = member.get("status")
+                            if status not in ("online", "idle", "dnd", "offline"):
+                                status = "online"
+                            avatar = str(member.get("avatar_url") or "")
+                            avatar_host = urlparse(avatar).hostname if avatar else None
+                            if urlparse(avatar).scheme != "https" or avatar_host not in ("cdn.discordapp.com", "media.discordapp.net"):
+                                avatar = ""
+                            game = member.get("game")
+                            game = str(game.get("name") or "")[:80] if isinstance(game, dict) else ""
+                            members.append({
+                                "username": str(member.get("username") or "สมาชิก")[:80],
+                                "status": status,
+                                "avatar_url": avatar,
+                                "game": game,
+                            })
+                        try:
+                            presence_count = max(0, int(raw.get("presence_count", len(members))))
+                        except (TypeError, ValueError):
+                            presence_count = len(members)
+                        cached = {
+                            "ok": True,
+                            "name": str(raw.get("name") or "Discord")[:100],
+                            "presence_count": presence_count,
+                            "members": members,
+                            "stale": False,
+                        }
+                        self.discord_cache.update({"at": now, "payload": cached})
+                    except Exception:
+                        if cached is None:
+                            return self._send(200, json.dumps({
+                                "ok": False,
+                                "error": "ดึงข้อมูลวิดเจ็ตไม่ได้ ตรวจสอบการเปิด Server Widget และอินเทอร์เน็ต",
+                            }, ensure_ascii=False))
+                        cached = dict(cached)
+                        cached["stale"] = True
+            return self._send(200, json.dumps(cached, ensure_ascii=False))
         if u.path == "/api/drives":
             return self._send(200, json.dumps({"drives": list_drives()}))
         if u.path == "/logo":
@@ -3240,7 +3299,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"ok": False, "error": message, "code": "error"}))
         if p not in ("/api/quit", "/api/bye") and _license_ui_snapshot().get("state") != "active":
             return self._send(423, json.dumps({"ok": False, "error": "กรุณาเปิดใช้งานด้วยคีย์ก่อน"}))
-        if p == "/api/set":
+        if p == "/api/open_discord":
+            try:
+                import webbrowser
+                ok = bool(webbrowser.open(DISCORD_INVITE_URL))
+            except Exception:
+                ok = False
+        elif p == "/api/set":
             ok = c.set_cfg(body.get("key"), body.get("value"))
         elif p == "/api/toggle":
             c.toggle()
@@ -3425,6 +3490,37 @@ html[data-theme="amoled"]{--bg:#000000;--bgrgb:0,0,0;--a1:#6366f1;--a2:#22d3ee;-
   backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);transition:opacity .25s}
 .card.dim{opacity:.4}
 .card h2{font-size:11.5px;font-weight:700;letter-spacing:.9px;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
+
+/* ---------- Discord live server panel ---------- */
+.discord-page{align-items:center;justify-content:center;padding:8px}
+.discord-widget{width:min(100%,360px);height:min(100%,390px);min-height:270px;display:flex;flex-direction:column;overflow:hidden;
+  border:1px solid #e2e4e8;border-radius:10px;background:#fff;color:#303338;box-shadow:0 5px 20px rgba(0,0,0,.18);font-family:"Segoe UI",system-ui,sans-serif}
+.discord-head{min-height:74px;flex:none;display:flex;align-items:center;gap:10px;padding:12px 16px;background:#5865f2;color:#fff}
+.discord-mark{width:31px;height:31px;flex:none}.discord-mark svg{width:100%;height:100%}
+.discord-name{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:19px;font-weight:800}
+.discord-count{flex:none;text-align:right;font-size:10.5px;line-height:1.4;white-space:nowrap}
+.discord-count b{display:block;font-size:12px;font-weight:600}
+.discord-list-head{display:flex;justify-content:space-between;gap:8px;padding:17px 18px 8px;color:#7c8188;font-size:11px;letter-spacing:.5px}
+#discordStatus{max-width:48%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:0;text-transform:none}
+.discord-members{flex:1;min-height:0;overflow-y:auto;padding:0 15px 10px}
+.discord-member{min-height:30px;display:flex;align-items:center;gap:8px;padding:3px 3px;font-size:12px;color:#4b5057}
+.discord-avatar{width:21px;height:21px;flex:none;display:grid;place-items:center;overflow:hidden;border-radius:50%;background:#5865f2;color:#fff;font-size:10px;font-weight:700}
+.discord-avatar img{width:100%;height:100%;object-fit:cover}
+.discord-member-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.discord-game{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#80858d;font-size:10px}
+.discord-dot{width:9px;height:9px;flex:none;border:1px solid #fff;border-radius:50%;background:#3ba55d;box-shadow:0 0 0 1px #d9dce0}
+.discord-dot.idle{background:#faa61a}.discord-dot.dnd{background:#ed4245}.discord-dot.offline{background:#747f8d}
+.discord-empty{padding:8px 3px;color:#7c8188;font-size:12px}
+.discord-foot{min-height:42px;flex:none;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 12px;border-top:1px solid #d9dce0;background:#fff;font-size:11px;color:#51555b}
+.discord-join{min-height:32px;padding:6px 11px;border-radius:5px;background:#5865f2;color:white;font-size:11px;font-weight:700;transition:filter .15s}
+.discord-join:hover{filter:brightness(.92)}.discord-join:focus-visible{outline:3px solid #1f6feb;outline-offset:2px}
+@media(max-width:560px){
+  .tb-brand span,.chips{display:none}
+  .tb-brand{gap:7px}.tb-brand b{font-size:12px}
+  .discord-name{font-size:13px;line-height:1.15;white-space:normal;text-overflow:clip;overflow-wrap:anywhere}
+  .discord-list-head{padding:13px 14px 6px}
+  .discord-foot{padding:7px 9px}.discord-foot>span{font-size:10px}
+}
 
 /* seg */
 .seg{position:relative;display:grid;grid-auto-flow:column;grid-auto-columns:1fr;padding:4px;border-radius:13px;
@@ -3696,6 +3792,7 @@ input[type=range]:active::-webkit-slider-thumb{box-shadow:0 0 0 8px rgba(var(--g
       <button class="nb on" data-page="0"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z"/></svg>มินิเกม</button>
       <button class="nb" data-page="1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="12" rx="3"/><path d="M7 10h.01M11 10h.01M15 10h.01M8 14h8"/></svg>กดรัว</button>
       <button class="nb" data-page="2"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>ตั้งค่า</button>
+      <button class="nb" data-page="3" aria-label="Discord"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M6 7.5c3.8-2.2 8.2-2.2 12 0 1.2 2 2 4.6 2.1 7.3-1.6 1.7-3.3 2.5-5.2 3l-.8-1.3M10 16.5l-.8 1.3c-1.9-.5-3.6-1.3-5.2-3C4.1 12.1 4.8 9.5 6 7.5"/><path d="M9 12.5h.01M15 12.5h.01"/><path d="M8 9.3c2.7-.8 5.3-.8 8 0"/></svg>Discord</button>
     </aside>
 
     <section class="pywebview-drag-region main">
@@ -3843,6 +3940,23 @@ input[type=range]:active::-webkit-slider-thumb{box-shadow:0 0 0 8px rgba(var(--g
                 </div>
               </div>
             </div>
+          </div>
+        </section>
+
+        <!-- ===== หน้า 4: Discord server widget ===== -->
+        <section class="pywebview-drag-region page discord-page" id="p3">
+          <div class="discord-widget" aria-label="รายชื่อสมาชิกออนไลน์ใน Discord">
+            <header class="discord-head">
+              <div class="discord-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M19.7 5.2a18.2 18.2 0 0 0-4.5-1.4l-.6 1.2a16.7 16.7 0 0 0-5.2 0l-.6-1.2a18.2 18.2 0 0 0-4.5 1.4C1.5 9.4.7 13.5 1.1 17.6a18.4 18.4 0 0 0 5.6 2.8l1.2-1.9-1.9-.9.5-.4c3.7 1.7 7.7 1.7 11.3 0l.5.4-1.9.9 1.2 1.9a18.4 18.4 0 0 0 5.6-2.8c.5-4.8-.8-8.9-3.5-12.4ZM8.7 15.2c-1.1 0-2-1-2-2.2s.9-2.2 2-2.2 2 .9 2 2.2-.9 2.2-2 2.2Zm6.6 0c-1.1 0-2-1-2-2.2s.9-2.2 2-2.2 2 .9 2 2.2-.9 2.2-2 2.2Z"/></svg></div>
+              <div class="discord-name" id="discordName">Discord</div>
+              <div class="discord-count"><b id="discordCount">—</b><span>Members Online</span></div>
+            </header>
+            <div class="discord-list-head"><span>MEMBERS ONLINE</span><span id="discordStatus" aria-live="polite">กำลังโหลด</span></div>
+            <div class="discord-members" id="discordMembers" aria-live="polite"><div class="discord-empty">กำลังโหลดรายชื่อ…</div></div>
+            <footer class="discord-foot">
+              <span>Hangout with people who get it</span>
+              <button class="discord-join" id="discordJoin" type="button">เปิด Discord</button>
+            </footer>
           </div>
         </section>
       </div>
@@ -4012,7 +4126,56 @@ $("#nav").addEventListener("click",e=>{
   const i=+b.dataset.page;
   $$("#nav button").forEach(x=>x.classList.toggle("on",x===b));
   $$(".page").forEach((p,j)=>p.classList.toggle("on",j===i));
+  if(i===3) startDiscordRefresh();
 });
+
+let discordTimer=null, discordBusy=false;
+function renderDiscord(data){
+  $("#discordName").textContent=data.name||"Discord";
+  $("#discordCount").textContent=Math.max(0,+data.presence_count||0).toLocaleString("en-US");
+  $("#discordStatus").textContent=data.stale?"ข้อมูลล่าสุด":"อัปเดตแล้ว";
+  const list=$("#discordMembers"); list.replaceChildren();
+  const members=Array.isArray(data.members)?data.members:[];
+  if(!members.length){
+    const empty=document.createElement("div"); empty.className="discord-empty"; empty.textContent="ไม่มีสมาชิกออนไลน์ที่แสดง"; list.append(empty); return;
+  }
+  for(const member of members){
+    const row=document.createElement("div"); row.className="discord-member";
+    const avatar=document.createElement("span"); avatar.className="discord-avatar";
+    if(member.avatar_url){
+      const img=document.createElement("img"); img.src=member.avatar_url; img.alt=""; img.loading="lazy";
+      img.onerror=()=>{ avatar.textContent=(member.username||"?").trim().slice(0,1).toUpperCase(); };
+      avatar.append(img);
+    }else avatar.textContent=(member.username||"?").trim().slice(0,1).toUpperCase();
+    const name=document.createElement("span"); name.className="discord-member-name";
+    name.textContent=member.username||"สมาชิก";
+    if(member.game){ const game=document.createElement("small"); game.className="discord-game"; game.textContent="กำลังเล่น "+member.game; name.append(game); }
+    const dot=document.createElement("i"); dot.className="discord-dot "+(["online","idle","dnd","offline"].includes(member.status)?member.status:"online");
+    dot.setAttribute("aria-label",member.status||"online");
+    row.append(avatar,name,dot); list.append(row);
+  }
+}
+async function refreshDiscord(){
+  if(discordBusy) return; discordBusy=true;
+  $("#discordStatus").textContent="กำลังโหลด";
+  try{
+    const data=await api("/api/discord_widget");
+    if(!data.ok) throw new Error(data.error||"โหลดไม่สำเร็จ");
+    renderDiscord(data);
+  }catch(e){
+    $("#discordStatus").textContent="เชื่อมต่อไม่ได้";
+    const list=$("#discordMembers"); list.replaceChildren();
+    const empty=document.createElement("div"); empty.className="discord-empty";
+    empty.textContent="ตรวจสอบอินเทอร์เน็ตและการเปิด Server Widget"; list.append(empty);
+  }finally{discordBusy=false;}
+}
+function startDiscordRefresh(){
+  refreshDiscord();
+  if(discordTimer===null) discordTimer=setInterval(()=>{
+    if($("#p3").classList.contains("on")) refreshDiscord();
+  },30000);
+}
+$("#discordJoin").addEventListener("click",()=>api("/api/open_discord",{}).catch(()=>{}));
 $("#modeSeg").addEventListener("click",e=>{
   const b=e.target.closest("button"); if(!b) return;
   api("/api/set",{key:"mode",value:b.dataset.mode});
